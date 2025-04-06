@@ -9,6 +9,9 @@ import torch.backends.cudnn as cudnn
 import qdarkstyle
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtGui import QIcon, QPixmap
+from PyQt5.QtCore import QThread, pyqtSignal, QMutex
+from PyQt5.QtMultimedia import QCamera, QCameraInfo, QCameraImageCapture
+from PyQt5.QtMultimediaWidgets import QCameraViewfinder
 
 from utils.general import check_img_size, non_max_suppression, scale_boxes, increment_path
 from utils.augmentations import letterbox
@@ -24,6 +27,219 @@ if str(ROOT) not in sys.path:
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 
+class VideoThread(QThread):
+    """视频处理线程，用于处理摄像头或视频的每一帧"""
+    update_frame = pyqtSignal(np.ndarray)
+    error_signal = pyqtSignal(str)
+    
+    def __init__(self, parent=None):
+        super(VideoThread, self).__init__(parent)
+        self.mutex = QMutex()
+        self.cap = None
+        self.is_running = False
+        self.model = None
+        self.device = None
+        self.imgsz = 640
+        self.half = False
+        self.names = []
+        self.colors = []
+        self.conf_thres = 0.4
+        self.iou_thres = 0.5
+        self.process_frequency = 1  # 每隔多少帧处理一次，对视频设为1以确保每帧都处理
+        self.frame_count = 0
+        self.video_path = None
+        self.is_video_file = False
+        
+    def setup(self, model, device, imgsz, half, names, colors, conf_thres, iou_thres):
+        """设置模型和参数"""
+        self.model = model
+        self.device = device
+        self.imgsz = imgsz
+        self.half = half
+        self.names = names
+        self.colors = colors
+        self.conf_thres = conf_thres
+        self.iou_thres = iou_thres
+        
+    def set_camera(self, camera_id=0):
+        """设置摄像头或视频文件
+        Args:
+            camera_id: 如果是整数则表示摄像头ID，如果是字符串则表示视频文件路径
+        """
+        try:
+            self.mutex.lock()
+            
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
+            
+            # 检测是否为视频文件
+            self.is_video_file = isinstance(camera_id, str) and os.path.isfile(camera_id)
+            
+            if self.is_video_file:
+                self.video_path = camera_id
+                print(f"正在打开视频文件: {self.video_path}")
+                self.cap = cv2.VideoCapture(self.video_path)
+                self.process_frequency = 1  # 视频文件处理每一帧
+            else:
+                print(f"正在打开摄像头 ID: {camera_id}")
+                self.cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
+                self.process_frequency = 3  # 摄像头处理可以跳帧以提高性能
+            
+            if not self.cap.isOpened():
+                error_msg = "无法打开摄像头设备" if not self.is_video_file else f"无法打开视频文件: {self.video_path}"
+                self.error_signal.emit(error_msg)
+                self.mutex.unlock()
+                return False
+                
+            # 获取视频属性
+            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
+            
+            device_type = "摄像头" if not self.is_video_file else "视频文件"
+            print(f"{device_type}已打开：分辨率 {width}x{height}, FPS: {fps}")
+            self.mutex.unlock()
+            return True
+        except Exception as e:
+            error_msg = f"设置{'视频' if self.is_video_file else '摄像头'}出错: {str(e)}"
+            self.error_signal.emit(error_msg)
+            
+            if self.mutex.tryLock():
+                self.mutex.unlock()
+            return False
+            
+    def run(self):
+        """线程运行函数"""
+        self.is_running = True
+        self.frame_count = 0
+        
+        while self.is_running:
+            try:
+                self.mutex.lock()
+                if self.cap is None or not self.cap.isOpened():
+                    self.mutex.unlock()
+                    # 视频文件结束
+                    if self.is_video_file:
+                        print("视频文件处理完毕")
+                        # 发送信号通知主线程
+                        self.error_signal.emit("VIDEO_END")
+                    else:
+                        print("摄像头已断开")
+                        self.error_signal.emit("摄像头连接丢失")
+                    break
+                    
+                ret, frame = self.cap.read()
+                self.mutex.unlock()
+                
+                if not ret or frame is None:
+                    # 视频结束或摄像头错误
+                    if self.is_video_file:
+                        print("视频文件读取完毕")
+                        self.error_signal.emit("VIDEO_END")
+                    else:
+                        self.error_signal.emit("无法获取摄像头画面")
+                    break
+                
+                self.frame_count += 1
+                
+                # 根据设置决定是否处理当前帧
+                if self.frame_count % self.process_frequency == 0:
+                    # 进行目标检测
+                    try:
+                        processed_frame = self.process_frame(frame)
+                        if processed_frame is not None:
+                            self.update_frame.emit(processed_frame)
+                        else:
+                            # 如果处理失败，仍然显示原始帧
+                            self.update_frame.emit(frame)
+                    except Exception as e:
+                        print(f"处理帧时出错: {str(e)}")
+                        # 出错时仍然显示原始帧
+                        self.update_frame.emit(frame)
+                else:
+                    # 直接发送原始帧
+                    self.update_frame.emit(frame)
+                    
+                # 摄像头模式下适当休眠，避免过度占用CPU
+                # 视频文件模式下可以不休眠，以最大速度处理
+                if not self.is_video_file:
+                    self.msleep(10)
+                
+            except Exception as e:
+                print(f"视频处理线程出错: {str(e)}")
+                self.error_signal.emit(f"处理视频帧时出错: {str(e)}")
+                if self.mutex.tryLock():
+                    self.mutex.unlock()
+                break
+                
+        print("视频处理线程已停止")
+        
+    def process_frame(self, frame):
+        """处理单帧图像"""
+        try:
+            if self.model is None:
+                return frame  # 如果模型未加载，直接返回原始帧
+                
+            with torch.no_grad():
+                # 创建原始图像的副本用于显示
+                showimg = frame.copy()
+                
+                # 预处理图像
+                img = letterbox(frame, new_shape=self.imgsz)[0]
+                img = img[:, :, ::-1].transpose(2, 0, 1)
+                img = np.ascontiguousarray(img)
+                img = torch.from_numpy(img).to(self.device)
+                img = img.half() if self.half else img.float()
+                img /= 255.0
+                if img.ndimension() == 3:
+                    img = img.unsqueeze(0)
+                
+                # 进行推理
+                pred = self.model(img)[0]
+                pred = non_max_suppression(pred, self.conf_thres, self.iou_thres)
+                
+                # 处理检测结果
+                for i, det in enumerate(pred):
+                    if det is not None and len(det):
+                        det[:, :4] = scale_boxes(
+                            img.shape[2:], det[:, :4], showimg.shape).round()
+                        
+                        for *xyxy, conf, cls in reversed(det):
+                            label = '%s %.2f' % (self.names[int(cls)], conf)
+                            plot_one_box(
+                                xyxy, showimg, label=label,
+                                color=self.colors[int(cls)], line_thickness=2)
+                
+                return showimg
+        except RuntimeError as e:
+            # 处理CUDA错误
+            if "CUDA out of memory" in str(e):
+                self.error_signal.emit("GPU内存不足，请尝试降低图像分辨率或使用CPU模式")
+            else:
+                self.error_signal.emit(f"目标检测处理出错: {str(e)}")
+            return None
+        except Exception as e:
+            self.error_signal.emit(f"目标检测处理出错: {str(e)}")
+            return None
+    
+    def stop(self):
+        """停止线程"""
+        self.is_running = False
+        self.wait(1000)  # 等待最多1秒线程结束
+        
+        try:
+            self.mutex.lock()
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
+            self.mutex.unlock()
+        except Exception as e:
+            print(f"释放视频资源时出错: {str(e)}")
+            if self.mutex.tryLock():
+                self.mutex.unlock()
+
+
 class Ui_MainWindow(QtWidgets.QMainWindow):
     def __init__(self, parent=None):
         super(Ui_MainWindow, self).__init__(parent)
@@ -31,11 +247,18 @@ class Ui_MainWindow(QtWidgets.QMainWindow):
         self.setupUi(self)
         self.init_logo()
         self.init_slots()
-        self.cap = None  # 初始化为None
+        self.cap = None
         self.out = None
         self.is_camera_open = False
         self.frame_count = 0
-        self.max_frames = 1000  # 设置最大帧数，防止内存泄漏
+        self.max_frames = 1000
+        self.last_frame_time = 0
+        self.frame_interval = 30
+        
+        # 创建视频处理线程
+        self.video_thread = VideoThread()
+        self.video_thread.update_frame.connect(self.update_frame)
+        self.video_thread.error_signal.connect(self.show_error)
         
         # GPU设置
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -76,6 +299,12 @@ class Ui_MainWindow(QtWidgets.QMainWindow):
             # 给每一个类别初始化颜色
             self.colors = [[random.randint(0, 255) for _ in range(3)] for _ in self.names]
             
+            # 设置线程的模型和参数
+            self.video_thread.setup(
+                self.model, self.device, self.imgsz, self.half,
+                self.names, self.colors, self.conf_thres, self.iou_thres
+            )
+            
             print("模型加载成功，使用设备:", self.device)
         except Exception as e:
             QtWidgets.QMessageBox.critical(
@@ -84,6 +313,10 @@ class Ui_MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.Ok
             )
             sys.exit(1)
+
+        # 摄像头对象
+        self.camera = None
+        self.viewfinder = None
 
     def setupUi(self, MainWindow):
         MainWindow.setObjectName("MainWindow")
@@ -286,13 +519,12 @@ class Ui_MainWindow(QtWidgets.QMainWindow):
         self.label.setText(_translate("MainWindow", "TextLabel"))
 
     def init_slots(self):
+        self.timer_video.timeout.connect(self.show_video_frame)
         self.pushButton_img.clicked.connect(self.button_image_open)
-        self.pushButton_imgs.clicked.connect(self.button_images_open)
-        self.pushButton_imgfile.clicked.connect(self.button_imagefile_open)
         self.pushButton_video.clicked.connect(self.button_video_open)
         self.pushButton_camera.clicked.connect(self.button_camera_open)
-        self.pushButton_showdir.clicked.connect(self.button_show_dir)
-        self.timer_video.timeout.connect(self.show_video_frame)
+        self.pushButton_imgs.clicked.connect(self.button_images_open)
+        self.pushButton_imgfile.clicked.connect(self.button_imagefile_open)
 
     def init_logo(self):
         pix = QtGui.QPixmap('')   # 绘制初始化图片
@@ -303,6 +535,7 @@ class Ui_MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         """重写关闭事件，确保资源正确释放"""
         try:
+            self.stop_video_processing()
             self.stop_camera()
         except:
             pass
@@ -525,8 +758,7 @@ class Ui_MainWindow(QtWidgets.QMainWindow):
                     new_height = int(img_height * scale)
                     
                     self.result = cv2.resize(self.result, (new_width, new_height), interpolation=cv2.INTER_AREA)
-                    self.QtImg = QtGui.QImage(self.result.data, self.result.shape[1], self.result.shape[0],
-                                             QtGui.QImage.Format_RGB32)
+                    self.QtImg = QtGui.QImage(self.result.data, self.result.shape[1], self.result.shape[0],QtGui.QImage.Format_RGB32)
                     self.label.setPixmap(QtGui.QPixmap.fromImage(self.QtImg))
                     
                     # 短暂延迟，让用户能看到每张图片的检测结果
@@ -559,168 +791,440 @@ class Ui_MainWindow(QtWidgets.QMainWindow):
             )
 
     def button_video_open(self):
-        video_name, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "打开视频", "", "*.mp4;;*.avi;;All Files(*)")
-
-        if not video_name:
-            self.empty_information()
-            print('empty!')
-            return
-
-        flag = self.cap.open(video_name)
-        if flag == False:
-            QtWidgets.QMessageBox.warning(
-                self, u"Warning", u"打开视频失败", buttons=QtWidgets.QMessageBox.Ok, defaultButton=QtWidgets.QMessageBox.Ok)
-        else:
-            self.out = cv2.VideoWriter(str(Path(self.save_file / 'vedio_prediction.avi')), cv2.VideoWriter_fourcc(
-                *'MJPG'), 20, (int(self.cap.get(3)), int(self.cap.get(4))))
-            self.timer_video.start(30)
-            self.pushButton_video.setDisabled(True)
-            self.pushButton_img.setDisabled(True)
-            self.pushButton_camera.setDisabled(True)
-
-    def button_camera_open(self):
+        """打开视频文件并进行实时检测"""
         try:
-            if not self.is_camera_open:
-                # 关闭之前的摄像头（如果存在）
-                self.stop_camera()
-                
-                # 创建新的VideoCapture对象
-                self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # 使用DirectShow后端
-                
-                if not self.cap.isOpened():
-                    QtWidgets.QMessageBox.warning(
-                        self, u"警告", u"无法打开摄像头，请检查设备连接", 
-                        buttons=QtWidgets.QMessageBox.Ok, 
-                        defaultButton=QtWidgets.QMessageBox.Ok)
-                    return
-                
-                # 设置摄像头参数
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                self.cap.set(cv2.CAP_PROP_FPS, 30)
-                
-                # 创建视频写入对象
-                if self.out is not None:
-                    self.out.release()
-                self.out = cv2.VideoWriter(
-                    str(Path(self.save_file / 'camera_prediction.avi')),
-                    cv2.VideoWriter_fourcc(*'MJPG'),
-                    20,
-                    (640, 480)
+            # 如果有正在运行的视频或摄像头，先停止
+            self.stop_video_processing()
+            
+            # 获取视频文件路径
+            video_name, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "打开视频", "", "视频文件 (*.mp4 *.avi);;所有文件 (*.*)"
+            )
+            
+            if not video_name:
+                self.empty_information()
+                print('未选择视频文件')
+                return
+            
+            # 创建视频捕获对象
+            self.cap = cv2.VideoCapture(video_name)
+            
+            if not self.cap.isOpened():
+                QtWidgets.QMessageBox.warning(
+                    self, "警告", "无法打开视频文件，请检查文件是否损坏",
+                    QtWidgets.QMessageBox.Ok
                 )
+                self.cap = None
+                return
+            
+            # 获取视频属性
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
+            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            print(f"视频信息: 分辨率={width}x{height}, FPS={fps}, 总帧数={total_frames}")
+            
+            # 创建输出视频
+            os.makedirs(self.save_file, exist_ok=True)
+            output_path = str(Path(self.save_file) / 'video_detection.avi')
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            
+            if not self.out.isOpened():
+                print(f"警告: 无法创建输出视频文件 {output_path}")
+            
+            # 设置视频处理线程
+            if self.video_thread.set_camera(video_name):
+                # 在线程中处理视频
+                self.video_thread.start()
                 
-                self.frame_count = 0  # 重置帧计数器
-                self.timer_video.start(30)  # 30ms = 约33fps
+                # 禁用其他按钮
                 self.pushButton_video.setDisabled(True)
                 self.pushButton_img.setDisabled(True)
-                self.pushButton_camera.setText(u"关闭摄像头")
+                self.pushButton_imgs.setDisabled(True)
+                self.pushButton_imgfile.setDisabled(True)
+                self.pushButton_camera.setDisabled(True)
+                
+                print(f"视频 {video_name} 开始处理")
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self, "警告", "无法启动视频处理线程",
+                    QtWidgets.QMessageBox.Ok
+                )
+                
+                # 清理资源
+                if self.cap is not None:
+                    self.cap.release()
+                    self.cap = None
+                
+                if self.out is not None:
+                    self.out.release()
+                    self.out = None
+        
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, "错误", f"视频处理出错: {str(e)}",
+                QtWidgets.QMessageBox.Ok
+            )
+            print(f"视频处理异常: {str(e)}")
+            self.stop_video_processing()
+
+    def show_video_frame(self):
+        """从视频文件读取并显示下一帧（已弃用，使用VideoThread替代）"""
+        try:
+            if self.cap is not None and self.cap.isOpened():
+                ret, frame = self.cap.read()
+                if ret:
+                    # 处理帧并显示
+                    processed = self.process_frame(frame)
+                    self.update_frame(processed if processed is not None else frame)
+                else:
+                    # 视频结束
+                    self.stop_video_processing()
+                    QtWidgets.QMessageBox.information(
+                        self, "提示", "视频播放完成",
+                        QtWidgets.QMessageBox.Ok
+                    )
+            else:
+                self.stop_video_processing()
+        except Exception as e:
+            print(f"视频帧处理出错: {str(e)}")
+            self.stop_video_processing()
+
+    def process_frame(self, frame):
+        """处理单个视频帧进行目标检测"""
+        try:
+            # 原始图像的副本用于显示
+            display_img = frame.copy()
+            
+            # 目标检测
+            with torch.no_grad():
+                # 预处理图像
+                input_img = letterbox(frame, new_shape=self.imgsz)[0]
+                input_img = input_img[:, :, ::-1].transpose(2, 0, 1)  # BGR转RGB并调整维度顺序
+                input_img = np.ascontiguousarray(input_img)
+                input_img = torch.from_numpy(input_img).to(self.device)
+                input_img = input_img.half() if self.half else input_img.float()
+                input_img /= 255.0
+                if input_img.ndimension() == 3:
+                    input_img = input_img.unsqueeze(0)
+                
+                # 推理
+                pred = self.model(input_img)[0]
+                pred = non_max_suppression(pred, self.conf_thres, self.iou_thres)
+                
+                # 在原图上绘制检测结果
+                for i, det in enumerate(pred):
+                    if det is not None and len(det):
+                        det[:, :4] = scale_boxes(input_img.shape[2:], det[:, :4], display_img.shape).round()
+                        
+                        for *xyxy, conf, cls in reversed(det):
+                            label = '%s %.2f' % (self.names[int(cls)], conf)
+                            plot_one_box(xyxy, display_img, label=label, color=self.colors[int(cls)], line_thickness=2)
+            
+            return display_img
+        except Exception as e:
+            print(f"处理视频帧时出错: {str(e)}")
+            return None
+
+    def stop_video_processing(self):
+        """安全停止视频处理并释放资源"""
+        try:
+            # 停止视频线程
+            if self.video_thread.isRunning():
+                self.video_thread.stop()
+                self.video_thread.wait()  # 等待线程结束
+            
+            # 停止定时器
+            if self.timer_video.isActive():
+                self.timer_video.stop()
+            
+            # 释放视频资源
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
+            
+            if self.out is not None:
+                self.out.release()
+                self.out = None
+            
+            # 恢复按钮状态
+            self.pushButton_video.setDisabled(False)
+            self.pushButton_img.setDisabled(False)
+            self.pushButton_imgs.setDisabled(False)
+            self.pushButton_imgfile.setDisabled(False)
+            self.pushButton_camera.setDisabled(False)
+            
+            # 恢复初始界面
+            self.init_logo()
+            
+            print("视频处理已停止，资源已释放")
+        except Exception as e:
+            print(f"停止视频处理时出错: {str(e)}")
+
+    def button_camera_open(self):
+        """使用PyQt5原生摄像头功能并添加目标检测"""
+        try:
+            if not self.is_camera_open:
+                print("正在打开摄像头...")
+                
+                # 禁用其他按钮
+                self.pushButton_video.setDisabled(True)
+                self.pushButton_img.setDisabled(True)
+                self.pushButton_imgs.setDisabled(True)
+                self.pushButton_imgfile.setDisabled(True)
+                
+                # 检查可用摄像头
+                available_cameras = QCameraInfo.availableCameras()
+                if not available_cameras:
+                    QtWidgets.QMessageBox.warning(
+                        self, "警告", "没有找到可用的摄像头设备", 
+                        QtWidgets.QMessageBox.Ok)
+                    self.stop_camera()
+                    return
+                
+                print(f"找到 {len(available_cameras)} 个摄像头设备")
+                for cam in available_cameras:
+                    print(f"  - {cam.description()}")
+                
+                # 创建摄像头对象
+                self.camera = QCamera(available_cameras[0])
+                
+                # 创建取景器
+                if self.viewfinder is None:
+                    self.viewfinder = QCameraViewfinder()
+                    self.viewfinder.show()
+                    
+                    # 将取景器添加到label位置
+                    self.label.setVisible(False)  # 隐藏原有label
+                    self.horizontalLayout.removeWidget(self.label)
+                    self.horizontalLayout.addWidget(self.viewfinder)
+                
+                # 设置取景器
+                self.camera.setViewfinder(self.viewfinder)
+                
+                # 创建图像捕获对象
+                self.camera_capture = QCameraImageCapture(self.camera)
+                self.camera_capture.setCaptureDestination(QCameraImageCapture.CaptureToBuffer)
+                self.camera_capture.imageCaptured.connect(self.process_captured_image)
+                
+                # 启动摄像头
+                self.camera.start()
+                
+                # 设置状态
                 self.is_camera_open = True
-                print("摄像头已打开")
+                self.detection_active = True
+                self.capture_count = 0
+                
+                # 启动检测定时器 - 每200毫秒捕获一帧进行检测
+                self.detection_timer = QtCore.QTimer()
+                self.detection_timer.timeout.connect(self.capture_frame)
+                self.detection_timer.start(200)  # 5fps检测频率，降低系统负担
+                
+                # 更新按钮文本
+                self.pushButton_camera.setText("关闭摄像头")
+                print("摄像头已打开，目标检测已启动")
             else:
                 self.stop_camera()
                 
         except Exception as e:
             print(f"打开摄像头时出错: {str(e)}")
             QtWidgets.QMessageBox.warning(
-                self, u"错误", f"摄像头操作出错: {str(e)}",
-                buttons=QtWidgets.QMessageBox.Ok,
-                defaultButton=QtWidgets.QMessageBox.Ok)
+                self, "错误", f"摄像头操作出错: {str(e)}", 
+                QtWidgets.QMessageBox.Ok)
             self.stop_camera()
-
-    def stop_camera(self):
-        """安全关闭摄像头"""
+    
+    def capture_frame(self):
+        """定时器触发函数，捕获当前帧进行检测"""
+        if self.is_camera_open and self.camera and self.camera.status() == QCamera.ActiveStatus:
+            self.capture_count += 1
+            self.camera_capture.capture()
+    
+    def process_captured_image(self, id, image):
+        """处理捕获的图像并进行目标检测"""
         try:
-            self.timer_video.stop()
-            if self.cap is not None:
-                if self.cap.isOpened():
-                    self.cap.release()
-                self.cap = None
-            if self.out is not None:
-                self.out.release()
-                self.out = None
-            self.label.clear()
-            self.init_logo()
-            self.pushButton_video.setDisabled(False)
-            self.pushButton_img.setDisabled(False)
-            self.pushButton_camera.setText(u"摄像头检测")
-            self.is_camera_open = False
-            self.frame_count = 0
-            print("摄像头已关闭")
-        except Exception as e:
-            print(f"关闭摄像头时出错: {str(e)}")
-
-    def show_video_frame(self):
-        try:
-            if self.cap is None or not self.cap.isOpened() or not self.is_camera_open:
+            # 将QImage转换为OpenCV格式
+            img = self.qimage_to_opencv(image)
+            if img is None:
                 return
-
-            # 检查帧数限制
-            if self.frame_count >= self.max_frames:
-                print("达到最大帧数限制，重置摄像头")
-                self.stop_camera()
-                self.button_camera_open()
-                return
-
-            name_list = []
-            ret, frame = self.cap.read()
             
-            if not ret or frame is None:
-                print("无法获取摄像头画面")
-                self.stop_camera()
-                return
-
-            self.frame_count += 1
-            showimg = frame.copy()
-
+            # 原始图像的副本用于显示
+            display_img = img.copy()
+            
+            # 目标检测
             with torch.no_grad():
                 # 预处理图像
-                img = letterbox(showimg, new_shape=self.imgsz)[0]
-                img = img[:, :, ::-1].transpose(2, 0, 1)
-                img = np.ascontiguousarray(img)
-                img = torch.from_numpy(img).to(self.device)
-                img = img.half() if self.half else img.float()
-                img /= 255.0
-                if img.ndimension() == 3:
-                    img = img.unsqueeze(0)
-
-                # 使用GPU进行推理
-                pred = self.model(img)[0]
+                input_img = letterbox(img, new_shape=self.imgsz)[0]
+                input_img = input_img[:, :, ::-1].transpose(2, 0, 1)  # BGR转RGB并调整维度顺序
+                input_img = np.ascontiguousarray(input_img)
+                input_img = torch.from_numpy(input_img).to(self.device)
+                input_img = input_img.half() if self.half else input_img.float()
+                input_img /= 255.0
+                if input_img.ndimension() == 3:
+                    input_img = input_img.unsqueeze(0)
+                
+                # 推理
+                pred = self.model(input_img)[0]
                 pred = non_max_suppression(pred, self.conf_thres, self.iou_thres)
-
-                # 处理检测结果
+                
+                # 在原图上绘制检测结果
                 for i, det in enumerate(pred):
                     if det is not None and len(det):
-                        det[:, :4] = scale_boxes(
-                            img.shape[2:], det[:, :4], showimg.shape).round()
+                        det[:, :4] = scale_boxes(input_img.shape[2:], det[:, :4], display_img.shape).round()
                         
                         for *xyxy, conf, cls in reversed(det):
                             label = '%s %.2f' % (self.names[int(cls)], conf)
-                            name_list.append(self.names[int(cls)])
-                            plot_one_box(
-                                xyxy, showimg, label=label,
-                                color=self.colors[int(cls)], line_thickness=2)
+                            plot_one_box(xyxy, display_img, label=label, color=self.colors[int(cls)], line_thickness=2)
+            
+            # 将处理后的图像显示在界面上
+            self.display_detection_result(display_img)
+            
+        except Exception as e:
+            print(f"处理捕获图像时出错: {str(e)}")
+    
+    def qimage_to_opencv(self, qimage):
+        """将QImage转换为OpenCV格式"""
+        try:
+            qimage = qimage.convertToFormat(QtGui.QImage.Format_RGB888)
+            width = qimage.width()
+            height = qimage.height()
+            
+            # 创建NumPy数组
+            ptr = qimage.bits()
+            ptr.setsize(qimage.byteCount())
+            img = np.array(ptr).reshape(height, width, 3)
+            
+            # 转换为BGR格式（OpenCV默认格式）
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            return img
+        except Exception as e:
+            print(f"QImage转换为OpenCV格式时出错: {str(e)}")
+            return None
+    
+    def display_detection_result(self, img):
+        """在独立窗口中显示检测结果"""
+        try:
+            # 创建检测结果的QImage
+            height, width, channel = img.shape
+            bytes_per_line = 3 * width
+            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            qt_img = QtGui.QImage(rgb_img.data, width, height, bytes_per_line, QtGui.QImage.Format_RGB888)
+            
+            # 创建一个新窗口显示检测结果
+            if not hasattr(self, 'detection_label'):
+                self.detection_label = QtWidgets.QLabel()
+                self.detection_label.setWindowTitle("目标检测结果")
+                self.detection_label.resize(width, height)
+                self.detection_label.show()
+            
+            # 更新图像
+            self.detection_label.setPixmap(QtGui.QPixmap.fromImage(qt_img))
+            
+        except Exception as e:
+            print(f"显示检测结果时出错: {str(e)}")
 
-            # 保存视频帧
-            if self.out is not None:
-                self.out.write(showimg)
-
-            # 显示处理后的图像
+    def update_frame(self, frame):
+        """更新UI中显示的帧"""
+        try:
+            if frame is None:
+                print("警告: 收到空帧")
+                return
+                
+            if self.out is not None and self.out.isOpened():
+                # 保存处理后的帧到输出视频
+                try:
+                    self.out.write(frame)
+                except Exception as e:
+                    print(f"写入输出视频时出错: {str(e)}")
+            
+            # 计算缩放比例，确保图片完整显示
             label_size = self.label.size()
-            img_height, img_width = showimg.shape[:2]
+            img_height, img_width = frame.shape[:2]
             scale = min(label_size.width() / img_width, label_size.height() / img_height)
             new_width = int(img_width * scale)
             new_height = int(img_height * scale)
             
-            show = cv2.resize(showimg, (new_width, new_height), interpolation=cv2.INTER_AREA)
-            self.result = cv2.cvtColor(show, cv2.COLOR_BGR2RGB)
-            showImage = QtGui.QImage(self.result.data, self.result.shape[1], self.result.shape[0],
-                                   QtGui.QImage.Format_RGB888)
-            self.label.setPixmap(QtGui.QPixmap.fromImage(showImage))
-
+            # 缩放图像
+            try:
+                resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            except Exception as e:
+                print(f"调整图像大小时出错: {str(e)}")
+                return
+                
+            # 转换颜色格式
+            try:
+                rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
+            except Exception as e:
+                print(f"转换颜色格式时出错: {str(e)}")
+                return
+                
+            # 显示图像
+            try:
+                qt_image = QtGui.QImage(
+                    rgb_frame.data, rgb_frame.shape[1], rgb_frame.shape[0],
+                    rgb_frame.shape[1] * 3, QtGui.QImage.Format_RGB888
+                )
+                self.label.setPixmap(QtGui.QPixmap.fromImage(qt_image))
+            except Exception as e:
+                print(f"创建QImage或设置Pixmap时出错: {str(e)}")
+            
         except Exception as e:
-            print(f"处理视频帧时出错: {str(e)}")
-            self.stop_camera()
+            print(f"更新画面出错: {str(e)}")
+
+    def show_error(self, error_message):
+        """显示错误消息"""
+        if error_message == "VIDEO_END":
+            # 视频播放结束的特殊信号
+            self.stop_video_processing()
+            QtWidgets.QMessageBox.information(
+                self, "提示", "视频处理完成", QtWidgets.QMessageBox.Ok
+            )
+        else:
+            # 常规错误信息
+            QtWidgets.QMessageBox.warning(
+                self, "错误", error_message, QtWidgets.QMessageBox.Ok
+            )
+
+    def stop_camera(self):
+        """安全关闭摄像头"""
+        print("正在关闭摄像头...")
+        try:
+            # 停止检测定时器
+            if hasattr(self, 'detection_timer') and self.detection_timer.isActive():
+                self.detection_timer.stop()
+            
+            # 停止摄像头
+            if self.camera is not None:
+                self.camera.stop()
+                self.camera = None
+            
+            # 关闭检测结果窗口
+            if hasattr(self, 'detection_label'):
+                self.detection_label.close()
+                del self.detection_label
+            
+            # 恢复UI
+            if self.viewfinder is not None:
+                self.viewfinder.setVisible(False)
+                self.horizontalLayout.removeWidget(self.viewfinder)
+                self.horizontalLayout.addWidget(self.label)
+                self.label.setVisible(True)
+                self.init_logo()
+            
+            # 恢复按钮状态
+            self.pushButton_video.setDisabled(False)
+            self.pushButton_img.setDisabled(False)
+            self.pushButton_imgs.setDisabled(False)
+            self.pushButton_imgfile.setDisabled(False)
+            self.pushButton_camera.setText("摄像头检测")
+            
+            # 重置状态
+            self.is_camera_open = False
+            
+            print("摄像头已关闭")
+        except Exception as e:
+            print(f"关闭摄像头时出错: {str(e)}")
 
     def button_show_dir(self):
         path = self.save_file
@@ -736,7 +1240,7 @@ if __name__ == '__main__':
     app.setStyleSheet(qdarkstyle.load_stylesheet_pyqt5())
     ui = Ui_MainWindow()
     # 设置窗口透明度
-    ui.setWindowOpacity(0.93)
+    ui.setWindowOpacity(1)
     # 去除顶部边框
     # ui.setWindowFlags(Qt.FramelessWindowHint)
     # 设置窗口图标
